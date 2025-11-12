@@ -8,7 +8,6 @@
 *.cia
 *.zip
 *.exe
-*.dldi
 /*.bin
 /*.dat
 ntro_default.dldi
