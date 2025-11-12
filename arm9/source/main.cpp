@@ -1,0 +1,291 @@
+/*-----------------------------------------------------------------
+ Copyright (C) 2005 - 2013
+	Michael "Chishm" Chisholm
+	Dave "WinterMute" Murphy
+	Claudio "sverx"
+
+ This program is free software; you can redistribute it and/or
+ modify it under the terms of the GNU General Public License
+ as published by the Free Software Foundation; either version 2
+ of the License, or (at your option) any later version.
+
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+
+ You should have received a copy of the GNU General Public License
+ along with this program; if not, write to the Free Software
+ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+------------------------------------------------------------------*/
+#include <nds.h>
+#include <nds/fifocommon.h>
+#include <nds/fifomessages.h>
+#include <stdio.h>
+#include <fat.h>
+#include <sys/stat.h>
+#include <limits.h>
+
+#include <string.h>
+#include <unistd.h>
+
+#include "args.h"
+#include "file_browse.h"
+#include "font.h"
+#include "hbmenu_consolebg.h"
+#include "iconTitle.h"
+#include "skin.h"
+#include "tonccpy.h"
+#include "nrio_detect.h"
+#include "nds_loader_arm9.h"
+#include "ttio.h"
+#include "ttio_dldi.h"
+
+#define BG_256_COLOR (BIT(7))
+#define FlashBase_S98	0x09000000
+
+using namespace std;
+
+volatile bool TTIOFatInit = false;
+volatile bool usingInternalFat = true;
+volatile bool guiEnabled = false;
+volatile bool gbaGuiEnabled = false;
+volatile bool TTIOInitFailed = false;
+
+// const bool BlankScreenOnBoot = true;
+
+static const int pathListSize = 4;
+static const int framePathListSize = 5;
+static const bool EnableAutoBoot = true;
+
+extern unsigned char ttio_dldi[];
+
+// First path is expected to be from internal fat image.
+static const char *PossiblePaths[4] = { "nitro:/R4Bootloader.nds", "ttio:/boot.nds", "ttio:/boot.dat", "ttio:/GBAExploader.nds" };
+
+// First path is expected to be from internal fat image.
+static const char *GBAFramePaths[5] = {
+	"nitro:/gbaframe.bmp",
+	"ttio:/gbaframe.bmp",
+	"ttio:/GBA_SIGN/gbaframe.bmp",
+	"ttio:/_system_/gbaframe.bmp",
+	"ttio:/ttmenu/gbaframe.bmp"
+};
+
+void InitGUI(void) {
+	if (guiEnabled)return;
+	guiEnabled = true;
+	gbaGuiEnabled = false;
+	iconTitleInit();
+	videoSetModeSub(MODE_4_2D);
+	vramSetBankC(VRAM_C_SUB_BG);
+	int bgSub = bgInitSub(3, BgType_Bmp8, BgSize_B8_256x256, 1, 0);
+	PrintConsole *console = consoleInit(0, 0, BgType_Text4bpp, BgSize_T_256x256, 4, 6, false, false);
+	dmaCopy(hbmenu_consolebgBitmap, bgGetGfxPtr(bgSub), 256*256);
+	ConsoleFont font;
+	font.gfx = (u16*)fontTiles;
+	font.pal = (u16*)fontPal;
+	font.numChars = 95;
+	font.numColors = (fontPalLen / 2);
+	font.bpp = 4;
+	font.asciiOffset = 32;
+	font.convertSingleColor = true;
+	consoleSetFont(console, &font);
+	dmaCopy(hbmenu_consolebgPal, BG_PALETTE_SUB, 256*2);
+	BG_PALETTE_SUB[255] = RGB15(31,31,31);
+	keysSetRepeat(25,5);
+	consoleSetWindow(console, 1, 1, 30, 22);
+}
+
+void InitGUIForGBA() {
+	if (gbaGuiEnabled)return;
+	gbaGuiEnabled = true;
+	guiEnabled = false;
+	videoSetMode(MODE_5_2D | DISPLAY_BG3_ACTIVE);
+	videoSetModeSub(MODE_5_2D | DISPLAY_BG3_ACTIVE);
+	vramSetBankA(VRAM_A_MAIN_BG_0x06000000);
+	vramSetBankB(VRAM_B_MAIN_BG_0x06020000);
+	vramSetBankC(VRAM_C_SUB_BG_0x06200000);
+	vramSetBankD(VRAM_D_LCD);
+	// for the main screen
+	REG_BG3CNT = BG_BMP16_256x256 | BG_BMP_BASE(0) | BG_WRAP_OFF;
+	REG_BG3PA = 1 << 8; //scale x
+	REG_BG3PB = 0; //rotation x
+	REG_BG3PC = 0; //rotation y
+	REG_BG3PD = 1 << 8; //scale y
+	REG_BG3X = 0; //translation x
+	REG_BG3Y = 0; //translation y*/
+	toncset((void*)BG_BMP_RAM(0),0,0x18000);
+	toncset((void*)BG_BMP_RAM(8),0,0x18000);
+	swiWaitForVBlank();
+}
+
+
+u16 Read_S98NOR_ID() {
+	*((vu16*)(FlashBase_S98)) = 0xF0;	
+	*((vu16*)(FlashBase_S98+0x555*2)) = 0xAA;
+	*((vu16*)(FlashBase_S98+0x2AA*2)) = 0x55;
+	*((vu16*)(FlashBase_S98+0x555*2)) = 0x90;
+	return *((vu16*)(FlashBase_S98+0xE*2));
+}
+
+void SetKernelRomPage() {
+	*(vu16*)0x09FE0000 = 0xD200;
+	*(vu16*)0x08000000 = 0x1500;
+	*(vu16*)0x08020000 = 0xD200;
+	*(vu16*)0x08040000 = 0x1500;
+	*(vu16*)0x09880000 = 0x8002; // Kernel section of NorFlash
+	*(vu16*)0x09FC0000 = 0x1500;
+}
+
+void LoadGBAFrame() {
+	InitGUIForGBA();
+	for (int i = 0; i < framePathListSize; i++) {
+		if ((i > 0)) {
+			if (!TTIOFatInit)TTIOFatInit = fatMountSimple("ttio", &io_ttio);
+			if (!TTIOFatInit)return;
+		}
+		if ((access(GBAFramePaths[i], F_OK) == 0) && LoadSkin(3, GBAFramePaths[i]))return;
+	}
+}
+
+void gbaMode() {
+	sysSetCartOwner(true);
+	
+	swiWaitForVBlank();
+	
+	if (Read_S98NOR_ID() == 0x223D)SetKernelRomPage();
+	
+	LoadGBAFrame();
+	
+	if(PersonalData->gbaScreen) { lcdMainOnBottom(); } else { lcdMainOnTop(); }
+	
+	sysSetCartOwner(false);
+	fifoSendValue32(FIFO_USER_01, 1);
+	REG_IME = 0;
+	irqDisable(IRQ_VBLANK);
+	while(1)swiWaitForVBlank();
+} 
+
+int stop(void) {
+	u32 pressed = 0;
+	while(1) {
+		swiWaitForVBlank();
+		scanKeys();
+		pressed = keysHeld();
+		if (pressed == 0)break;
+	}
+	swiWaitForVBlank();
+	while(1) {
+		swiWaitForVBlank();
+		scanKeys();
+		pressed = keysHeld();
+		if (pressed > 0)break;
+	}
+	return 0;
+}
+
+void createDLDIFile() {
+	if (access("ttio:/ttio.dldi", F_OK) != 0) {
+		FILE *dldiFile = fopen("ttio:/ttio.dldi", "wb");
+		fwrite(ttio_dldi, 0x62C, 1, dldiFile);
+		fclose(dldiFile);
+	}
+}
+
+void fatInitFailedMessage(bool nitroInitFailed) {
+	consoleClear();
+	if (nitroInitFailed) {
+		printf ("\n\n\n\n\n\n\n\n\n\n       NITRO INIT FAILED!\n");
+	} else {
+		printf ("\n\n\n\n\n\n\n\n\n\n        TTIO INIT FAILED!\n");
+	}
+}
+
+int FileBrowser() {
+	InitGUI();
+	consoleClear();
+	while(1) {
+		swiWaitForVBlank();
+		scanKeys();
+		if (!keysHeld())break;
+	}
+	vector<string> extensionList = argsGetExtensionList();
+	if (access("nitro:/", F_OK) == 0)chdir("nitro:/");
+	while(1) {
+		string filename = browseForFile(extensionList);
+		if (TTIOInitFailed) return 0;
+		// Construct a command line
+		vector<string> argarray;
+		if (!argsFillArray(filename, argarray)) {
+			printf("Invalid NDS or arg file selected\n");
+		} else {
+			iprintf("Running %s with %d parameters\n", argarray[0].c_str(), argarray.size());
+			// Make a copy of argarray using C strings, for the sake of runNdsFile
+			vector<const char*> c_args;
+			for (const auto& arg: argarray) { c_args.push_back(arg.c_str()); }
+			// Try to run the NDS file with the given arguments
+			int err = runNdsFile(c_args[0], c_args.size(), &c_args[0]);
+			iprintf("Start failed. Error %i\n", err);
+		}
+		argarray.clear();
+	}
+	return 0;
+}
+
+int main(int argc, char **argv) {
+	// overwrite reboot stub identifier
+	// so tapping power on DSi returns to DSi menu
+	extern u64 *fake_heap_end;
+	*fake_heap_end = 0;
+	if (!fatMountSimple("nitro", dldiGetInternal())) {
+		InitGUI();
+		fatInitFailedMessage(true);
+		return stop();
+	}
+	swiWaitForVBlank();
+	scanKeys();
+	u32 key = keysDown();
+	bool autoBoot = false;
+	switch (key) {
+		case KEY_B: gbaMode(); break;
+		case KEY_A: {
+			if((access("nitro:/mmcf.nds", F_OK) == 0))runNdsFile("nitro:/mmcf.nds", 0, NULL);
+		} break;
+		case KEY_Y: {
+			if((access("nitro:/GodMode9i.nds", F_OK) == 0))runNdsFile("nitro:/GodMode9i.nds", 0, NULL);
+		} break;
+		case KEY_SELECT: autoBoot = EnableAutoBoot; break;
+		case 0: {
+			autoBoot = EnableAutoBoot;
+			if (access("nitro:/nrio-usb-disk.nds", F_OK) == 0) {
+				nrio_usb_type_t usb = nrio_usb_detect();
+				if (usb.board_type != 0)runNdsFile("nitro:/nrio-usb-disk.nds", 0, NULL);
+			}
+		} break;
+	}
+	if (autoBoot) {
+		for (int i = 0; i < pathListSize; i++) {
+			if ((i > 0) && !TTIOFatInit) {
+				if (!TTIOFatInit)TTIOFatInit = fatMountSimple("ttio", &io_ttio);
+				if (!TTIOFatInit) {
+					TTIOInitFailed = true;
+					fatInitFailedMessage(false);
+					return stop();
+				}
+				createDLDIFile();
+				usingInternalFat = false;
+			}
+			if (access(PossiblePaths[i], F_OK) == 0)runNdsFile(PossiblePaths[i], 0, NULL);
+		}
+	}
+	if (!usingInternalFat)usingInternalFat = true;
+	FileBrowser();
+	if (TTIOInitFailed) {
+		fatInitFailedMessage(false);
+		return stop();
+	}
+	return stop();
+}
+
